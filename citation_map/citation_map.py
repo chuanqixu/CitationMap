@@ -1,7 +1,6 @@
 # Copyright (c) 2024 Chen Liu
 # All rights reserved.
 import folium
-import itertools
 import pandas as pd
 import os
 import pickle
@@ -21,47 +20,65 @@ from typing import Any, Dict, List, Tuple, Optional
 from .scholarly_support import get_citing_author_ids_and_citing_papers, get_organization_name, NO_AUTHOR_FOUND_STR, KNOWN_AFFILIATION_DICT
 
 
-def find_all_citing_authors(scholar_id: str, num_processes: int = 16) -> List[Tuple[str]]:
+def find_all_citing_authors(scholar_id: str,
+                            progress_cache_path: Optional[str] = None,
+                            blocked_wait_minutes: float = 30,
+                            max_blocked_waits: int = 8) -> List[Tuple[str]]:
     '''
     Step 1. Find all publications of the given Google Scholar ID.
     Step 2. Find all citing authors.
+
+    The publication list and the citing authors of each publication are saved to `progress_cache_path`
+    as soon as they are found, so an interrupted run resumes where it stopped.
+    When Google Scholar blocks us, we wait `blocked_wait_minutes` and load the same page again,
+    giving up after `max_blocked_waits` waits.
     '''
-    # Find Google Scholar Profile using Scholar ID.
-    author = scholarly.search_author_id(scholar_id)
-    author = scholarly.fill(author, sections=['publications'])
-    publications = author['publications']
+    # 'publications': [(title, cites_ids, num_citations)] for each of your publications.
+    # 'citing': cites_id -> [(citing author ID, citing paper title)], for the cites_ids done so far.
+    progress = {}
+    if progress_cache_path is not None and os.path.exists(progress_cache_path):
+        progress = load_cache(progress_cache_path)
+        print('Resuming from %s.\n' % progress_cache_path)
+
+    if 'publications' not in progress:
+        # Find Google Scholar Profile using Scholar ID.
+        author = scholarly.search_author_id(scholar_id)
+        author = scholarly.fill(author, sections=['publications'])
+        # The publication list already holds the title, Google Scholar publication IDs and number of citations,
+        # so we do not need to fill each publication, which would cost one more Google Scholar request each.
+        progress['publications'] = [(pub['bib']['title'], pub.get('cites_id', []), pub.get('num_citations', 0))
+                                    for pub in author['publications']]
+        progress['citing'] = {}
+        if progress_cache_path is not None:
+            save_cache(progress, progress_cache_path)
+    publications, citing_by_cites_id = progress['publications'], progress['citing']
     print('Author profile found, with %d publications.\n' % len(publications))
-
-    # Fetch metadata for all publications.
-    if isinstance(num_processes, int) and num_processes > 1:
-        with Pool(processes=num_processes) as pool:
-            all_publications = list(tqdm(pool.imap(__fill_publication_metadata, publications),
-                                         desc='Filling metadata for your %d publications' % len(publications),
-                                         total=len(publications)))
-    else:
-        all_publications = []
-        for pub in tqdm(publications,
-                        desc='Filling metadata for your %d publications' % len(publications),
-                        total=len(publications)):
-            all_publications.append(__fill_publication_metadata(pub))
-
-    # Convert all publications to Google Scholar publication IDs and paper titles.
-    # This is fast and no parallel processing is needed.
-    all_publication_info = []
-    for pub in all_publications:
-        if 'cites_id' in pub:
-            for cites_id in pub['cites_id']:
-                pub_title = pub['bib']['title']
-                all_publication_info.append((cites_id, pub_title))
 
     # Find all citing authors from all publications.
     # To best solve CAPTCHA problems, we won't perform parallel processing here.
-    all_citing_author_paper_info_nested = []
-    for pub in tqdm(all_publication_info,
-                    desc='Finding citing authors and papers on your %d publications' % len(all_publication_info),
-                    total=len(all_publication_info)):
-        all_citing_author_paper_info_nested.append(__citing_authors_and_papers_from_publication(pub))
-    all_citing_author_paper_tuple_list = list(itertools.chain(*all_citing_author_paper_info_nested))
+    all_cites_ids = [cites_id for _, cites_ids, _ in publications for cites_id in cites_ids]
+    pending_cites_ids = [cites_id for cites_id in all_cites_ids if cites_id not in citing_by_cites_id]
+    for cites_id in tqdm(pending_cites_ids,
+                         desc='Finding citing authors and papers on your %d publications' % len(all_cites_ids),
+                         total=len(all_cites_ids),
+                         initial=len(all_cites_ids) - len(pending_cites_ids)):
+        citing_paper_search_url = 'https://scholar.google.com/scholar?hl=en&cites=' + cites_id
+        citing_by_cites_id[cites_id] = get_citing_author_ids_and_citing_papers(citing_paper_search_url,
+                                                                               blocked_wait_minutes=blocked_wait_minutes,
+                                                                               max_blocked_waits=max_blocked_waits)
+        if progress_cache_path is not None:
+            save_cache(progress, progress_cache_path)
+
+    all_citing_author_paper_tuple_list = []
+    for cited_paper_title, cites_ids, num_citations in publications:
+        citing_paper_titles = set()
+        for cites_id in cites_ids:
+            for citing_author_id, citing_paper_title in citing_by_cites_id[cites_id]:
+                all_citing_author_paper_tuple_list.append((citing_author_id, citing_paper_title, cited_paper_title))
+                citing_paper_titles.add(citing_paper_title)
+        if len(citing_paper_titles) < num_citations:
+            print('[Warning!] Found %d of the %d citing papers Google Scholar reports for "%s".' % (
+                len(citing_paper_titles), num_citations, cited_paper_title))
     return all_citing_author_paper_tuple_list
 
 def find_all_citing_affiliations(all_citing_author_paper_tuple_list: List[Tuple[str]],
@@ -368,19 +385,6 @@ def count_citation_stats(coordinates_and_info: List[Tuple[str]]) -> List[int]:
             len(unique_author_list), len(unique_affiliation_list), len(unique_country_list)
     return num_authors, num_affiliations, num_countries
 
-def __fill_publication_metadata(pub):
-    time.sleep(random.uniform(1, 5))  # Random delay to reduce risk of being blocked.
-    return scholarly.fill(pub)
-
-def __citing_authors_and_papers_from_publication(cites_id_and_cited_paper: Tuple[str, str]):
-    cites_id, cited_paper_title = cites_id_and_cited_paper
-    citing_paper_search_url = 'https://scholar.google.com/scholar?hl=en&cites=' + cites_id
-    citing_authors_and_citing_papers = get_citing_author_ids_and_citing_papers(citing_paper_search_url)
-    citing_author_paper_info = []
-    for citing_author_id, citing_paper_title in citing_authors_and_citing_papers:
-        citing_author_paper_info.append((citing_author_id, citing_paper_title, cited_paper_title))
-    return citing_author_paper_info
-
 def __lookup_citing_authors(author_ids: List[str],
                             affiliation_by_author_id: Dict[str, Optional[Tuple[str, str]]],
                             failed_author_ids: set,
@@ -578,8 +582,8 @@ def generate_citation_map(scholar_id: str,
         If true, print the list of citing affiliations (affiliations of citing authors).
     blocked_wait_minutes: float
         (default is 30)
-        When Google Scholar blocks us while finding affiliations, wait this many minutes before retrying.
-        Citing authors already looked up are saved in `cache_folder`, so you can also stop and rerun later.
+        When Google Scholar blocks us, wait this many minutes before retrying.
+        Progress is saved in `cache_folder` as we go, so you can also stop and rerun later.
     max_blocked_waits: int
         (default is 8)
         Give up after waiting this many times in a row without any progress.
@@ -595,8 +599,10 @@ def generate_citation_map(scholar_id: str,
 
         if cache_folder is not None:
             cache_path = os.path.join(cache_folder, scholar_id, 'all_citing_author_paper_tuple_list.pkl')
+            progress_cache_path = os.path.join(cache_folder, scholar_id, 'citing_author_paper_progress.pkl')
         else:
             cache_path = None
+            progress_cache_path = None
 
         if cache_path is None or not os.path.exists(cache_path):
             print('No cache found for this author. Finding citing authors from scratch.\n')
@@ -604,11 +610,17 @@ def generate_citation_map(scholar_id: str,
             # NOTE: Step 1. Find all publications of the given Google Scholar ID.
             #       Step 2. Find all citing authors.
             all_citing_author_paper_tuple_list = find_all_citing_authors(scholar_id=scholar_id,
-                                                                         num_processes=num_processes)
+                                                                         progress_cache_path=progress_cache_path,
+                                                                         blocked_wait_minutes=blocked_wait_minutes,
+                                                                         max_blocked_waits=max_blocked_waits)
             print('A total of %d citing authors recorded.\n' % len(all_citing_author_paper_tuple_list))
             if cache_path is not None and len(all_citing_author_paper_tuple_list) > 0:
                 save_cache(all_citing_author_paper_tuple_list, cache_path)
-            print('Saved to cache: %s.\n' % cache_path)
+                print('Saved to cache: %s.\n' % cache_path)
+            # The progress is complete now. Remove it, so that deleting the cache above
+            # finds your citing authors from scratch again rather than reusing old progress.
+            if progress_cache_path is not None and os.path.exists(progress_cache_path):
+                os.remove(progress_cache_path)
 
         else:
             print('Cache found. Loading author paper information from cache.\n')

@@ -4,9 +4,13 @@ import random
 import time
 from bs4 import BeautifulSoup
 from typing import List
+from scholarly import MaxTriesExceededException
 from selenium import webdriver
 
 NO_AUTHOR_FOUND_STR = 'No_author_found'
+
+# Elements that Google uses to show a CAPTCHA instead of (or on top of) the search results.
+CAPTCHA_ELEMENT_IDS = ['gs_captcha_ccl', 'recaptcha', 'captcha-form']
 
 # Observation: the Nominatim package is very bad at getting the geolocation of companies (geolocation of universities are fine).
 # Temporary solution: hard code the geolocations of the companies.
@@ -76,51 +80,77 @@ def get_html_per_citation_page(soup) -> List[str]:
     return citing_authors_and_citing_papers
 
 
-def get_citing_author_ids_and_citing_papers(paper_url: str) -> List[str]:
+def is_results_page(soup) -> bool:
+    '''
+    Check if the page lists Google Scholar search results, rather than a CAPTCHA or an error page.
+    '''
+    if soup.find(id=CAPTCHA_ELEMENT_IDS) is not None:
+        return False
+    return soup.find('div', class_='gs_ri') is not None or soup.find(id='gs_res_ccl_mid') is not None
+
+def load_results_page(driver, url: str, blocked_wait_minutes: float = 30, max_blocked_waits: int = 8):
+    '''
+    Load a page of Google Scholar search results and return its soup.
+    If there is a CAPTCHA, wait for the user to solve it in the browser.
+    If we are blocked, wait `blocked_wait_minutes` and load the same page again, giving up after `max_blocked_waits` waits.
+    We never return a page that is not a results page, so that no citing paper is silently missed.
+    '''
+    num_blocked_waits = 0
+    while True:
+        driver.get(url)
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        if is_results_page(soup):
+            return soup
+
+        if soup.find(id=CAPTCHA_ELEMENT_IDS) is not None or 'CAPTCHA' in driver.page_source or 'not a robot' in driver.page_source:
+            print("\n" + "="*60)
+            print("CAPTCHA DETECTED! Please solve it in the browser.")
+            print("Press Enter here after you've solved it...")
+            print("="*60)
+            input()  # Wait for user to press Enter
+            continue  # Load the page again, in case solving the CAPTCHA did not bring us back to it.
+
+        if num_blocked_waits >= max_blocked_waits:
+            raise MaxTriesExceededException(
+                'Still blocked by Google Scholar after waiting %d times when loading %s. '
+                'Progress is saved. Run again later (or from another network) to resume.' % (num_blocked_waits, url))
+        num_blocked_waits += 1
+        print('\n[WARNING!] Blocked by Google Scholar when loading %s. '
+              'Waiting %g minutes before loading it again (wait %d/%d). '
+              'You can also stop now (Ctrl+C) and rerun later to resume.' % (url, blocked_wait_minutes, num_blocked_waits, max_blocked_waits))
+        time.sleep(blocked_wait_minutes * 60)
+
+def get_citing_author_ids_and_citing_papers(paper_url: str,
+                                            blocked_wait_minutes: float = 30,
+                                            max_blocked_waits: int = 8) -> List[str]:
     '''
     Find the (Google Scholar IDs of authors, titles of papers) who cite a given paper on Google Scholar.
 
     Parameters
     --------
     paper_url: URL of the paper BEING cited.
+    blocked_wait_minutes, max_blocked_waits: what to do when Google Scholar blocks us, see `load_results_page`.
     '''
     citing_authors_and_citing_papers = []
 
     driver = get_driver()
-    time.sleep(random.uniform(1, 5))  # Random delay to reduce risk of being blocked.
+    url = paper_url
+    page_number = 1
+    while url is not None:
+        time.sleep(random.uniform(1, 5))  # Random delay to reduce risk of being blocked.
+        soup = load_results_page(driver, url, blocked_wait_minutes=blocked_wait_minutes, max_blocked_waits=max_blocked_waits)
 
-    # Search the url of all citing papers.
-    driver.get(paper_url)
-    wait_for_captcha(driver)
+        # Loop through the citation results and find citing authors and papers.
+        citing_authors_and_citing_papers += get_html_per_citation_page(soup)
 
-    # Get the HTML data.
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-
-    # Check for common indicators of blocking
-    if 'Access Denied' in soup.text or 'Forbidden' in soup.text:
-        print('[WARNING!] Access denied or forbidden when searching searching %s.' % paper_url)
-        return []
-
-    # Loop through the citation results and find citing authors and papers.
-    current_page_number = 1
-    citing_authors_and_citing_papers += get_html_per_citation_page(soup)
-
-    # Find the page navigation.
-    navigation_buttons = soup.find_all('a', class_='gs_nma')
-    for navigation in navigation_buttons:
-        page_number_str = navigation.text
-        if page_number_str and page_number_str.isnumeric() and int(page_number_str) == current_page_number + 1:
-            # Found the correct button for next page.
-            current_page_number += 1
-            next_url = 'https://scholar.google.com' + navigation['href']
-            time.sleep(random.uniform(1, 5))  # Random delay to reduce risk of being blocked.
-
-            driver.get(next_url)
-            wait_for_captcha(driver)
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            citing_authors_and_citing_papers += get_html_per_citation_page(soup)
-        else:
-            continue
+        # Find the link to the next page. Look for it on every page rather than only on the first one,
+        # which may not link to all pages.
+        page_number += 1
+        url = None
+        for navigation in soup.find_all('a', class_='gs_nma'):
+            if navigation.text.strip() == str(page_number):
+                url = 'https://scholar.google.com' + navigation['href']
+                break
 
     return citing_authors_and_citing_papers
 

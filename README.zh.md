@@ -168,7 +168,7 @@ Liu, Chen. "CitationMap: A Python Tool to Identify and Visualize Your Google Sch
 - **use_proxy**: 是否使用代理（默认 False），部分环境可减少封禁，但通常更慢。
 - **pin_colorful**: 地图上的点是否多色（默认 True）。
 - **print_citing_affiliations**: 是否打印引用者机构列表（默认 True）。
-- **blocked_wait_minutes**: 识别机构时若被谷歌学术封禁，等待多少分钟后重试（默认 30）。已查过的引用作者会保存在 `cache_folder` 中，也可以直接停止、稍后重跑。
+- **blocked_wait_minutes**: 被谷歌学术封禁时，等待多少分钟后重试（默认 30）。进度会随时保存在 `cache_folder` 中，也可以直接停止、稍后重跑。
 - **max_blocked_waits**: 连续等待这么多次仍没有任何进展时放弃（默认 8）。
 
 ## 局限
@@ -181,7 +181,7 @@ Liu, Chen. "CitationMap: A Python Tool to Identify and Visualize Your Google Sch
 
 1. **`MaxTriesExceededException`** 或 **`Exception: Failed to fetch the Google Scholar page`** 或 所有条目都出现 **`[WARNING!] Blocked by CAPTCHA or robot check`**  
    - 通常是 IP 因请求过多被谷歌学术限制。可尝试连上学校 VPN 再运行；或更换 IP、减少进程数（如 `num_processes=1`）。若只有少数几次该警告且引用作者很多，一般可忽略。
-   - 识别机构时，每个查过的引用作者都会存入缓存；被封禁时会等待（`blocked_wait_minutes`）后重试，而不是直接报错。中途停止或放弃后，稍后重跑即可从断点继续。
+   - 每篇论文的引用列表和每个引用作者的机构，一查到就会存入缓存；被封禁时会等待（`blocked_wait_minutes`）后重试同一页或同一作者，而不是直接报错或跳过。中途停止或放弃后，稍后重跑即可从断点继续。
 2. **`An attempt has been made to start a new process before the current process has finished its bootstrapping phase.`**  
    - 多半是未使用 `if __name__ == '__main__':` 保护主逻辑。若仍报错，可参考 [Issue #4](https://github.com/ChenLiu-1996/CitationMap/issues/4#issuecomment-2257572672) 中 [dk-liang](https://github.com/dk-liang) 的写法，在入口处加上 `multiprocessing.freeze_support()` 再调用 `main()`。
 
