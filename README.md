@@ -193,6 +193,13 @@ Liu, Chen. "CitationMap: A Python Tool to Identify and Visualize Your Google Sch
     print_citing_affiliations: bool
         (default is True)
         If true, print the list of citing affiliations (affiliations of citing authors).
+    blocked_wait_minutes: float
+        (default is 30)
+        When Google Scholar blocks us while finding affiliations, wait this many minutes before retrying.
+        Citing authors already looked up are saved in `cache_folder`, so you can also stop and rerun later.
+    max_blocked_waits: int
+        (default is 8)
+        Give up after waiting this many times in a row without any progress.
     ```
 
 ## Limitations
@@ -218,6 +225,7 @@ Liu, Chen. "CitationMap: A Python Tool to Identify and Visualize Your Google Sch
 1. `MaxTriesExceededException` or `Exception: Failed to fetch the Google Scholar page` or (`[WARNING!] Blocked by CAPTCHA or robot check` for all entries).
 
     - From my experience, these are good indicators that your IP address is blocked by Google Scholar due to excessive crawling (using the `scholarly` package).
+    - While finding affiliations, every citing author looked up is saved in the cache, and a block makes the tool wait (`blocked_wait_minutes`) and retry instead of crashing. If you stop it or it gives up, just run it again later and it resumes where it stopped.
     - One hot fix I found was to hop on a University VPN and run again. I typically experience this error after running the tool twice, and I need to disconnect and reconnect my VPN to "unblock" myself.
     - In case this does not help, you can try to change IP adress and reduce the number of processes (e.g., setting `num_processes=1`).
     - If you get `[WARNING!] Blocked by CAPTCHA or robot check` no more than several times, it's not a big deal especially if you have many citing authors.
